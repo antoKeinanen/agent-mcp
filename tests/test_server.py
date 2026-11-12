@@ -90,3 +90,14 @@ def test_bad_config_is_rejected_at_startup(modules: dict, fragment: str) -> None
     with pytest.raises((ConfigError, ValueError)) as err:
         server_for(modules)
     assert fragment in str(err.value)
+
+
+def test_allowed_hosts_lock_host_header_and_refuse_browsers() -> None:
+    from agent_mcp.config import ServerConfig
+    from agent_mcp.server import transport_security
+
+    assert transport_security(ServerConfig()) is None
+    ts = transport_security(ServerConfig(allowed_hosts=["agent-mcp", "mcp.local:9000"]))
+    assert ts.enable_dns_rebinding_protection
+    assert ts.allowed_hosts == ["agent-mcp", "agent-mcp:*", "mcp.local:9000"]
+    assert ts.allowed_origins == []

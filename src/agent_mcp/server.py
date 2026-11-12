@@ -9,9 +9,10 @@ from datetime import UTC, datetime
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 
-from agent_mcp.config import Config, Exposed
+from agent_mcp.config import Config, Exposed, ServerConfig
 
 audit = logging.getLogger("agent_mcp.audit")
 
@@ -60,6 +61,17 @@ def _audited(name: str, fn: Callable[..., Any]) -> Callable[..., Any]:
         return result
 
     return run_sync
+
+
+def transport_security(cfg: ServerConfig) -> TransportSecuritySettings | None:
+    """Accept only the configured Host headers, and no browser Origin at all.
+
+    Server-side MCP clients send no Origin, so they pass. A browser on the host does, so a web
+    page can't reach the server through its container IP (DNS rebinding)."""
+    if not cfg.allowed_hosts:
+        return None
+    hosts = [h for name in cfg.allowed_hosts for h in ((name,) if ":" in name else (name, f"{name}:*"))]
+    return TransportSecuritySettings(enable_dns_rebinding_protection=True, allowed_hosts=hosts, allowed_origins=[])
 
 
 def build(config: Config, exposed: list[Exposed]) -> MCPServer:

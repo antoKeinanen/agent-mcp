@@ -1,0 +1,9 @@
+.env
+.env.*
+!.env.example
+agent-mcp.toml
+*.jsonl
+.venv/
+.git/
+__pycache__/
+tests/
