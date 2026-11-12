@@ -27,7 +27,7 @@ from agent_mcp.module import Module, tool
 from .feeds import FEEDS, FeedEvent, window
 from .google import CalendarError, GoogleCalendar, oauth_token_provider
 from .matching import matches_pattern, similar
-from .signin import refresh_token, sign_in_help
+from .signin import complete_sign_in, parse_code, refresh_token, sign_in_help
 
 log = logging.getLogger("agent_mcp.calendar")
 
@@ -113,7 +113,7 @@ class Calendar(Module[CalendarSettings]):
         else:
             secret = s.client_secret.get_secret_value()
             try:
-                token = await refresh_token(
+                token, warning = await refresh_token(
                     self.http,
                     s.client_id,
                     secret,
@@ -124,19 +124,62 @@ class Calendar(Module[CalendarSettings]):
             except CalendarError as e:
                 self.signed_out = str(e)
             except httpx.HTTPError as e:
-                self.signed_out = f"Could not reach Google to finish sign-in ({e!r}); restart to retry."
+                self.signed_out = sign_in_help(s.client_id, f"Could not reach Google to finish sign-in ({e!r}).")
+            except Exception as e:  # never take the server down over sign-in
+                log.exception("calendar: sign-in failed")
+                self.signed_out = sign_in_help(s.client_id, f"Sign-in failed unexpectedly ({e!r}).")
             else:
-                help = sign_in_help(s.client_id, "Google refused the saved sign-in (revoked or expired).")
-                self.api = GoogleCalendar(oauth_token_provider(s.client_id, secret, token, help))
-                log.info("calendar: signed in to Google")
+                self._signed_in(token, warning)
                 return
         log.warning("calendar: %s", self.signed_out)
+
+    def _signed_in(self, token: str, warning: str | None) -> None:
+        s = self.settings
+        assert s.client_id and s.client_secret
+        refused = sign_in_help(s.client_id, "Google refused the saved sign-in (revoked or expired).")
+        self.api = GoogleCalendar(oauth_token_provider(s.client_id, s.client_secret.get_secret_value(), token, refused))
+        self.signed_out = None
+        if warning:
+            log.warning("calendar: %s", warning)
+        else:
+            log.info("calendar: signed in to Google")
 
     async def stop(self) -> None:
         if self.api is not None:
             await self.api.close()
         if self.http is not None:
             await self.http.aclose()
+
+    # ---- sign-in -------------------------------------------------------------------------
+
+    @tool
+    async def sign_in(self, redirect_url: str) -> dict[str, Any]:
+        """Finish Google sign-in with the URL the user's browser landed on after allowing access
+        (http://localhost/?code=..., a page that doesn't load). Call it as soon as the user gives
+        you that URL: the code in it expires within minutes and works once. Only works while
+        signed out; the error from any other calendar tool contains the sign-in link to give them.
+        """
+        s = self.settings
+        if self.api is not None:
+            raise CalendarError("Already signed in to Google. Nothing to do.")
+        if not (s.client_id and s.client_secret):
+            raise CalendarError(self.signed_out or "Set AGENT_MCP__CALENDAR__CLIENT_ID and CLIENT_SECRET first.")
+        code = parse_code(redirect_url)
+        if not code or code.startswith("http"):
+            raise CalendarError(sign_in_help(s.client_id, "That URL has no ?code=... in it."))
+        assert self.http is not None, "module not started"
+        try:
+            token, warning = await complete_sign_in(
+                self.http,
+                s.client_id,
+                s.client_secret.get_secret_value(),
+                code,
+                s.token_file.expanduser() if s.token_file else None,
+            )
+        except httpx.HTTPError as e:
+            raise CalendarError(f"Could not reach Google ({e!r}). Try again with the same URL.") from e
+        self._signed_in(token, warning)
+        return {"signed_in": True, "saved": warning is None, **({"warning": warning} if warning else {})}
 
     # ---- reading -------------------------------------------------------------------------
 

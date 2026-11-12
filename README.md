@@ -35,11 +35,13 @@ docker compose logs agent-mcp                   # shows the Google sign-in link 
 
 Sign-in needs no shell in the container:
 
-1. Open the sign-in link from the log. Until you sign in, the calendar tools return the same link, so the agent can hand it to you.
-2. Allow access. The browser lands on a `http://localhost/?code=…` page that doesn't load. Copy its URL.
-3. Add it to `.env` as `AGENT_MCP__CALENDAR__AUTH_CODE="<that URL>"`, then run `docker compose up -d` within 10 minutes, before the code expires.
+1. Ask the agent to do something with your calendar. Until you sign in, every calendar tool returns a sign-in link, so the agent hands it to you. It's also in the log.
+2. Open the link and allow access. The browser then tries to open `http://localhost/?code=…` and shows "can't be reached". That's expected: nothing needs to run there, and the code is in the address bar.
+3. Paste that address to the agent. It calls `calendar_sign_in`, which exchanges the code within seconds. You're signed in with no `.env` edit and no restart.
 
-The container exchanges the code once and saves the refresh token in the `agent-mcp-data` volume, so restarts and image updates keep you signed in. To switch accounts, paste a new code. If Google revokes access, the tools return a fresh link.
+The refresh token is saved in the `agent-mcp-data` volume, so restarts and image updates keep you signed in. If Google revokes access, the tools return a fresh link. Without the `sign_in` tool, you can instead put the address in `.env` as `AGENT_MCP__CALENDAR__AUTH_CODE` and run `docker compose up -d` within 10 minutes. Each code works only once.
+
+In Google Cloud → OAuth consent screen, set the app to **In production**. While it's in *Testing*, Google expires the sign-in after 7 days.
 
 `.github/workflows/container.yml` runs the tests, then builds the image for amd64 and arm64. On `main` it pushes `ghcr.io/antokeinanen/agent-mcp:latest` and `:sha-<commit>`. On a `v1.2.3` tag it also pushes `:1.2.3` and `:1.2`. Pull requests only build. The repository is private, so the package is too. Before pulling, run `docker login ghcr.io` with a personal access token that has the `read:packages` scope.
 
@@ -114,6 +116,7 @@ It uses a Google Calendar quirk. Events are created in a **hidden** "scheduling"
 | `calendar_organizations` | Shows the configured organizations: sources, feeds, ignore lists, instructions |
 | `calendar_scan` | Reads an organization's event feed and labels each upcoming event `missing`, `duplicate` or `ignored` |
 | `calendar_schedule` | The only write. See below |
+| `calendar_sign_in` | Finishes Google sign-in from the URL your browser lands on. Only works while signed out |
 
 `calendar_schedule(organization, title, start, end?, description, location, source_url?, end_estimated, dry_run)`:
 

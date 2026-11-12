@@ -7,7 +7,7 @@ import httpx
 import pytest
 from mcp import Client
 
-from agent_mcp.config import Config, plan
+from agent_mcp.config import Config, Exposed, plan
 from agent_mcp.modules.calendar import Calendar
 from agent_mcp.modules.calendar.signin import parse_code, sign_in_url
 from agent_mcp.server import build
@@ -99,8 +99,8 @@ async def test_new_auth_code_replaces_saved_token(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("status", "body", "message"),
     [
-        (400, {"error": "invalid_grant"}, "expired or was already used"),
-        (401, {"error": "invalid_client"}, "rejected AGENT_MCP__CALENDAR__AUTH_CODE (invalid_client)"),
+        (400, {"error": "invalid_grant", "error_description": "Bad Request"}, "already used (invalid_grant: Bad"),
+        (401, {"error": "invalid_client", "error_description": "Unauthorized"}, "(invalid_client: Unauthorized)"),
         (200, {"access_token": "a"}, "no refresh token"),
     ],
 )
@@ -113,10 +113,61 @@ async def test_failed_exchange_keeps_server_up_with_fresh_link(
     assert not (tmp_path / "t.json").exists()
 
 
-async def test_auth_code_without_token_file_is_explained() -> None:
+async def test_auth_code_without_token_file_signs_in_for_this_run(caplog: pytest.LogCaptureFixture) -> None:
     m = module({**CLIENT, "auth_code": "c"})
     await m.start()
-    assert m.api is None and "TOKEN_FILE" in m.signed_out
+    assert m.api is not None and "TOKEN_FILE isn't set" in caplog.text
+
+
+async def test_unsavable_token_is_kept_in_memory_not_retried(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("")
+    endpoint = FakeTokenEndpoint()
+    m = module({**CLIENT, "auth_code": "c", "token_file": str(blocker / "t.json")}, endpoint)
+    await m.start()  # used to crash here, and the restart then replayed the spent code
+    assert m.api is not None and len(endpoint.calls) == 1
+    assert "saving the sign-in" in caplog.text
+
+
+async def test_unexpected_sign_in_failure_keeps_server_up(monkeypatch: pytest.MonkeyPatch) -> None:
+    import agent_mcp.modules.calendar as cal
+
+    async def boom(*_: object) -> tuple[str, None]:
+        raise RuntimeError("disk on fire")
+
+    monkeypatch.setattr(cal, "refresh_token", boom)
+    m = module({**CLIENT, "auth_code": "c"})
+    await m.start()
+    assert m.api is None and "disk on fire" in m.signed_out and "accounts.google.com" in m.signed_out
+
+
+def tool_client(m: Calendar) -> Client:
+    cfg = Config.model_validate({"modules": {"calendar": {"tools": ["*"], "settings": SETTINGS}}})
+    return Client(build(cfg, [Exposed(m, list(m.bound_tools().values()))]))
+
+
+async def test_sign_in_tool_exchanges_at_once_and_saves(tmp_path: Path) -> None:
+    token_file = tmp_path / "t.json"
+    endpoint = FakeTokenEndpoint()
+    m = module({**CLIENT, "token_file": str(token_file)}, endpoint)
+    async with tool_client(m) as c:
+        r = await c.call_tool("calendar_calendars", {})
+        assert r.is_error and "calendar_sign_in" in r.content[0].text  # the agent learns what to do
+        bad = await c.call_tool("calendar_sign_in", {"redirect_url": "http://localhost/?error=access_denied"})
+        assert bad.is_error and "no ?code=" in bad.content[0].text
+        ok = await c.call_tool("calendar_sign_in", {"redirect_url": REDIRECT})
+        assert ok.structured_content == {"signed_in": True, "saved": True}
+        again = await c.call_tool("calendar_sign_in", {"redirect_url": REDIRECT})
+        assert again.is_error and "Already signed in" in again.content[0].text
+    assert m.api is not None and len(endpoint.calls) == 1
+    assert json.loads(token_file.read_text())["refresh_token"] == "1//refresh"
+
+
+async def test_sign_in_tool_reports_spent_code() -> None:
+    m = module(CLIENT, FakeTokenEndpoint(400, {"error": "invalid_grant", "error_description": "Bad Request"}))
+    async with tool_client(m) as c:
+        r = await c.call_tool("calendar_sign_in", {"redirect_url": REDIRECT})
+    assert r.is_error and "already used" in r.content[0].text and m.api is None
 
 
 async def test_configured_refresh_token_wins(tmp_path: Path) -> None:
