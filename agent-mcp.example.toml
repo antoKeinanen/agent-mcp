@@ -1,0 +1,12 @@
+[server]
+name = "agent-mcp"
+transport = "stdio"
+# audit_log = "audit.jsonl"
+
+# A module is loaded only if it has a section here.
+# `tools` is required. List each tool to expose, or ["*"] for all.
+[modules.example]
+tools = ["greet"]
+
+[modules.example.settings]
+greeting = "hei"
