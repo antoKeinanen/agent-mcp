@@ -1,6 +1,18 @@
 # The server is reachable only from containers on the `agents` network, at
 # http://agent-mcp:8765/mcp. No ports are published on the host.
 services:
+  # Hands /data to the app's user (uid 10001) before it starts. A volume first created by an
+  # older image, or a bind mount, is otherwise root-owned, and the app runs without the
+  # capabilities to fix that itself.
+  agent-mcp-data-owner:
+    image: busybox:1.36.1
+    user: root
+    command: ["chown", "-R", "10001:10001", "/data"]
+    volumes:
+      - agent-mcp-data:/data
+    network_mode: none
+    restart: "no"
+
   agent-mcp:
     image: ghcr.io/antokeinanen/agent-mcp:latest   # pushed by .github/workflows/container.yml
     build: .                                       # `docker compose up --build` builds locally instead
@@ -19,6 +31,9 @@ services:
       # AGENT_MCP__SERVER__AUDIT_LOG: /data/audit.jsonl
     volumes:
       - agent-mcp-data:/data
+    depends_on:
+      agent-mcp-data-owner:
+        condition: service_completed_successfully
     networks: [agents]
     restart: unless-stopped
     read_only: true
