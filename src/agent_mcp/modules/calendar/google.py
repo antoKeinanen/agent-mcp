@@ -10,6 +10,8 @@ from typing import Any
 
 import httpx
 
+from agent_mcp.module import ToolError
+
 API = "https://www.googleapis.com/calendar/v3"
 AUTH_URI = "https://accounts.google.com/o/oauth2/auth"
 TOKEN_URI = "https://oauth2.googleapis.com/token"
@@ -21,12 +23,17 @@ SCOPES = [
 type TokenProvider = Callable[[], Awaitable[str]]
 
 
-class CalendarError(Exception):
-    pass
+class CalendarError(ToolError):
+    """A failure whose message the agent should see."""
 
 
-def oauth_token_provider(client_id: str, client_secret: str, refresh_token: str) -> TokenProvider:
-    """Access tokens minted from a refresh token, renewed shortly before they expire."""
+def oauth_token_provider(
+    client_id: str, client_secret: str, refresh_token: str, refused: str = "Google refused the refresh token."
+) -> TokenProvider:
+    """Access tokens minted from a refresh token, renewed shortly before they expire.
+
+    `refused` is the message the agent gets if Google rejects the refresh token."""
+    from google.auth.exceptions import RefreshError
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
 
@@ -43,7 +50,10 @@ def oauth_token_provider(client_id: str, client_secret: str, refresh_token: str)
     async def token() -> str:
         async with lock:
             if not creds.valid:
-                await asyncio.to_thread(creds.refresh, Request())
+                try:
+                    await asyncio.to_thread(creds.refresh, Request())
+                except RefreshError as e:
+                    raise CalendarError(refused) from e
             return creds.token
 
     return token

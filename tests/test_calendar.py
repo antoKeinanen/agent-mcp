@@ -79,7 +79,12 @@ def google() -> FakeGoogle:
     return FakeGoogle()
 
 
-def client(google: FakeGoogle, tools: list[str] | None = None, settings: dict | None = None) -> Client:
+def client(
+    google: FakeGoogle,
+    tools: list[str] | None = None,
+    settings: dict | None = None,
+    feed: httpx.MockTransport | None = None,
+) -> Client:
     cfg = Config.model_validate(
         {"modules": {"calendar": {"tools": tools or ["*"], "settings": settings or SETTINGS}}}
     )
@@ -89,6 +94,8 @@ def client(google: FakeGoogle, tools: list[str] | None = None, settings: dict | 
         return "t"
 
     exposed[0].module.api = GoogleCalendar(token, httpx.MockTransport(google.handle))
+    if feed is not None:
+        exposed[0].module.http = httpx.AsyncClient(transport=feed)
     return Client(build(cfg, exposed))
 
 
@@ -188,3 +195,18 @@ def test_org_cannot_invite_its_own_scheduling_calendar() -> None:
     cfg = Config.model_validate({"modules": {"calendar": {"tools": ["*"], "settings": bad}}})
     with pytest.raises(ConfigError, match="must differ"):
         plan(cfg, {"calendar": Calendar})
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        ({"start": "2026-11-20T18:00", "end": "2026-11-20T17:00"}, "end must be after start"),
+        ({"start": "next friday"}, "not an ISO date"),
+        ({"organization": "nope", "start": "2026-11-20T18:00"}, "unknown organization 'nope'"),
+    ],
+)
+async def test_errors_reach_the_agent(google: FakeGoogle, args: dict, message: str) -> None:
+    async with client(google) as c:
+        r = await c.call_tool("calendar_schedule", {"organization": "tko-aly", "title": "T", **args})
+    assert r.is_error and message in r.content[0].text
+    assert google.writes == []

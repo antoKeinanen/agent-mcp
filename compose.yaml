@@ -13,14 +13,20 @@ services:
       AGENT_MCP__SERVER__PORT: "8765"
       # Answer only to the Docker DNS name; refuse browser Origins.
       AGENT_MCP__SERVER__ALLOWED_HOSTS: agent-mcp
+      # Sign-in from AGENT_MCP__CALENDAR__AUTH_CODE is saved here, so the one-use code is
+      # needed only once. Remove this line if the calendar module isn't enabled.
+      AGENT_MCP__CALENDAR__TOKEN_FILE: /data/google-token.json
       # AGENT_MCP__SERVER__AUDIT_LOG: /data/audit.jsonl
-    # volumes:
-    #   - ./data:/data
+    volumes:
+      - agent-mcp-data:/data
     networks: [agents]
     restart: unless-stopped
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
+
+volumes:
+  agent-mcp-data:
 
 networks:
   agents:

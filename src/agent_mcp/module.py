@@ -2,7 +2,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
+from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import BaseModel, ConfigDict
+
+__all__ = ["BoundTool", "Module", "NoSettings", "ToolError", "ToolInfo", "tool"]
 
 
 class NoSettings(BaseModel):
