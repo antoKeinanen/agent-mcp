@@ -2,3 +2,4 @@
 __pycache__/
 agent-mcp.toml
 *.jsonl
+.env

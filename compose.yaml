@@ -1,0 +1,27 @@
+# The server is reachable only from containers on the `agents` network, at
+# http://agent-mcp:8765/mcp. No ports are published on the host.
+services:
+  agent-mcp:
+    image: ghcr.io/antokeinanen/agent-mcp:latest   # pushed by .github/workflows/container.yml
+    build: .                                       # `docker compose up --build` builds locally instead
+    container_name: agent-mcp
+    env_file: .env
+    environment:
+      # Pinned here so a stdio setting in .env can't break the container.
+      AGENT_MCP__SERVER__TRANSPORT: streamable-http
+      AGENT_MCP__SERVER__HOST: 0.0.0.0
+      AGENT_MCP__SERVER__PORT: "8765"
+      # Answer only to the Docker DNS name; refuse browser Origins.
+      AGENT_MCP__SERVER__ALLOWED_HOSTS: agent-mcp
+      # AGENT_MCP__SERVER__AUDIT_LOG: /data/audit.jsonl
+    # volumes:
+    #   - ./data:/data
+    networks: [agents]
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+networks:
+  agents:
+    name: agents

@@ -10,3 +10,6 @@ tools = ["greet"]
 
 [modules.example.settings]
 greeting = "hei"
+
+# Everything here can also be set in .env (see .env.example), which wins over this file.
+# The calendar module is configured there, including its Google credentials.
