@@ -1,0 +1,30 @@
+[project]
+name = "agent-mcp"
+version = "0.1.0"
+description = "Modular MCP server that exposes an allowlisted set of tools to an agent"
+readme = "README.md"
+authors = [
+    { name = "Anto Keinänen", email = "antokeinanen@iki.fi" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "mcp>=2.3.0",
+    "pydantic>=2.14.3",
+]
+
+[project.scripts]
+agent-mcp = "agent_mcp.__main__:main"
+
+[build-system]
+requires = ["uv_build>=0.13.6,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "pytest-asyncio>=1.5.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
