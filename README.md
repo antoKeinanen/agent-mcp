@@ -41,6 +41,8 @@ Sign-in needs no shell in the container:
 
 The refresh token is saved in the `agent-mcp-data` volume, so restarts and image updates keep you signed in. If Google revokes access, the tools return a fresh link. Without the `sign_in` tool, you can instead put the address in `.env` as `AGENT_MCP__CALENDAR__AUTH_CODE` and run `docker compose up -d` within 10 minutes. Each code works only once.
 
+The app runs as uid 10001 with every capability dropped, so it can't take ownership of `/data` itself. Before each start, `compose.yaml` runs a short `agent-mcp-data-owner` container that runs `chown -R 10001:10001 /data`. If you use your own compose file or a bind mount (`./data:/data`), do the same, or run `sudo chown -R 10001:10001 ./data` once.
+
 In Google Cloud → OAuth consent screen, set the app to **In production**. While it's in *Testing*, Google expires the sign-in after 7 days.
 
 `.github/workflows/container.yml` runs the tests, then builds the image for amd64 and arm64. On `main` it pushes `ghcr.io/antokeinanen/agent-mcp:latest` and `:sha-<commit>`. On a `v1.2.3` tag it also pushes `:1.2.3` and `:1.2`. Pull requests only build. The repository is private, so the package is too. Before pulling, run `docker login ghcr.io` with a personal access token that has the `read:packages` scope.
