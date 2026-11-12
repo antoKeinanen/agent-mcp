@@ -2,9 +2,10 @@
 
 1. Without a refresh token the server still starts and hands out a sign-in URL.
 2. After signing in, Google sends the browser to http://localhost/?code=... . That page
-   doesn't load, which is fine: its URL is copied into AGENT_MCP__CALENDAR__AUTH_CODE.
-3. On the next start the code is exchanged for a refresh token, saved to `token_file`, and
-   reused from then on. A code works once, so the saved token is what survives restarts.
+   doesn't load, which is fine: its URL holds the code.
+3. That URL goes to the `sign_in` tool (exchanged at once, no restart) or into
+   AGENT_MCP__CALENDAR__AUTH_CODE (exchanged on the next start). The refresh token is saved
+   to `token_file` and reused from then on. A code works once.
 """
 
 import hashlib
@@ -36,9 +37,10 @@ def sign_in_url(client_id: str) -> str:
 def sign_in_help(client_id: str, reason: str = "Google Calendar is not signed in.") -> str:
     return (
         f"{reason} To sign in: (1) open {sign_in_url(client_id)} and allow access; "
-        "(2) the browser then goes to a localhost page that doesn't load, so copy that page's full URL; "
-        f'(3) put it in .env as {AUTH_CODE_VAR}="<the URL>" and restart (docker compose up -d) '
-        "within 10 minutes, before the code expires."
+        "(2) the browser then goes to a localhost page that doesn't load, which is expected: copy the full "
+        "URL from the address bar; (3) give that URL to the agent, which passes it to calendar_sign_in "
+        f'right away. Or put it in .env as {AUTH_CODE_VAR}="<the URL>" and restart (docker compose up -d) '
+        "within 10 minutes. Each code works once."
     )
 
 
@@ -87,15 +89,38 @@ async def exchange_code(http: httpx.AsyncClient, client_id: str, client_secret: 
             "grant_type": "authorization_code",
         },
     )
-    body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+    try:
+        body = r.json()
+    except ValueError:
+        body = {}
     if r.is_error:
-        error = body.get("error", r.status_code)
+        error = body.get("error", f"HTTP {r.status_code}")
+        detail = f": {body['error_description']}" if body.get("error_description") else ""
         if error == "invalid_grant":
-            raise CalendarError(sign_in_help(client_id, f"{AUTH_CODE_VAR} has expired or was already used."))
-        raise CalendarError(sign_in_help(client_id, f"Google rejected {AUTH_CODE_VAR} ({error})."))
+            reason = f"Google says the sign-in code has expired or was already used (invalid_grant{detail})."
+        else:
+            reason = f"Google rejected the sign-in code ({error}{detail})."
+        raise CalendarError(sign_in_help(client_id, reason))
     if not body.get("refresh_token"):
         raise CalendarError(sign_in_help(client_id, "Google returned no refresh token."))
     return body["refresh_token"]
+
+
+async def complete_sign_in(
+    http: httpx.AsyncClient, client_id: str, client_secret: str, code: str, token_file: Path | None
+) -> tuple[str, str | None]:
+    """Exchange a code and try to save the token. Returns (token, warning if it couldn't be saved).
+
+    A failed save never loses the token: the code is spent by now, so the caller keeps the
+    token in memory rather than failing and retrying a code Google will refuse."""
+    token = await exchange_code(http, client_id, client_secret, code)
+    if token_file is None:
+        return token, "Signed in, but AGENT_MCP__CALENDAR__TOKEN_FILE isn't set, so the sign-in is lost on restart."
+    try:
+        save_token(token_file, client_id, token, code)
+    except OSError as e:
+        return token, f"Signed in, but saving the sign-in to {token_file} failed ({e}); it is lost on restart."
+    return token, None
 
 
 async def refresh_token(
@@ -105,20 +130,16 @@ async def refresh_token(
     configured: str | None,
     token_file: Path | None,
     auth_code: str | None,
-) -> str:
-    """Pick the refresh token: configured > saved (unless a new code was pasted) > exchanged code."""
+) -> tuple[str, str | None]:
+    """Pick the refresh token: configured > saved (unless a new code was pasted) > exchanged code.
+
+    Returns (token, warning)."""
     if configured:
-        return configured
+        return configured, None
     code = parse_code(auth_code) if auth_code else None
     saved, saved_code = load_token(token_file, client_id) if token_file else (None, None)
     if saved and (code is None or saved_code == _fingerprint(code)):
-        return saved
+        return saved, None
     if code is None:
         raise CalendarError(sign_in_help(client_id))
-    if token_file is None:
-        raise CalendarError(
-            f"{AUTH_CODE_VAR} needs AGENT_MCP__CALENDAR__TOKEN_FILE set, so the token outlives the one-use code."
-        )
-    token = await exchange_code(http, client_id, client_secret, code)
-    save_token(token_file, client_id, token, code)
-    return token
+    return await complete_sign_in(http, client_id, client_secret, code, token_file)
