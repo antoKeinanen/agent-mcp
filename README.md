@@ -153,6 +153,27 @@ With the rules in config, the prompt can be short:
 
 > For each organization from `calendar_organizations`, run `calendar_scan`. For each event marked `missing`, check that it isn't really the same as an existing or ignored event, then call `calendar_schedule` with its `schedule` arguments. Add an `end` only if the description clearly states one. Report what you scheduled and what you skipped.
 
+## Todo module
+
+Lets the agent manage todos in **one** Google Tasks list and nothing else.
+
+| Tool | Does |
+| --- | --- |
+| `todo_items` | Lists the todos in the list. Open ones only unless `include_completed`; `due_by` filters by due date |
+| `todo_add` | Adds a todo: `title`, `notes`, `due` (a date; Google Tasks keeps no time of day), `parent_id` for a subtask |
+| `todo_update` | Changes title, notes or due date. `due=""` removes the due date |
+| `todo_complete` | Marks a todo done, or not done again with `done=false` |
+| `todo_delete` | Deletes a todo |
+| `todo_sign_in` | Finishes Google sign-in, like `calendar_sign_in`. Only works while signed out |
+
+`task_list` (a name or ID) names the list. There's no tool that lists your task lists, so the agent can't see the others. Every request goes to that list's ID, and before a todo is changed, deleted or used as a parent, the module checks that Google reports it in that list. A task ID from another list gets "not found in the todo list". The `tasks` OAuth scope covers all your lists, so the module's code is what enforces this. If you want Google to enforce it, keep the list on a separate Google account and sign in as that account.
+
+### Setup
+
+1. Create the list in Google Tasks (e.g. "Agent"). Set `AGENT_MCP__TODO__TASK_LIST` to its name.
+2. In Google Cloud, enable the **Google Tasks API**. The calendar's OAuth client works: put the same ID and secret in `AGENT_MCP__TODO__CLIENT_ID` and `AGENT_MCP__TODO__CLIENT_SECRET`.
+3. Sign in. It's separate from the calendar's sign-in, with the same steps: ask the agent for your todos, open the link it gives you, and paste the address back so it can call `todo_sign_in`. Set `AGENT_MCP__TODO__TOKEN_FILE=/data/google-todo-token.json` so the sign-in survives restarts. Or run `uv run agent-mcp-google-auth todo` on a machine with a browser.
+
 ## Writing a module
 
 Add a file under `src/agent_mcp/modules/`. Any `Module` subclass there is discovered by its `name`.

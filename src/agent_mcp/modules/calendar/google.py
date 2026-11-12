@@ -4,23 +4,20 @@ It can read anything, but the only write it has is `insert_event`. The module de
 where that may be called. There is deliberately no update, delete, patch or RSVP method.
 """
 
-import asyncio
-from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
 
+from agent_mcp.google_signin import AUTH_URI, TOKEN_URI, TokenProvider
 from agent_mcp.module import ToolError
 
+__all__ = ["AUTH_URI", "SCOPES", "TOKEN_URI", "CalendarError", "GoogleCalendar", "oauth_token_provider"]
+
 API = "https://www.googleapis.com/calendar/v3"
-AUTH_URI = "https://accounts.google.com/o/oauth2/auth"
-TOKEN_URI = "https://oauth2.googleapis.com/token"
 SCOPES = [
     "https://www.googleapis.com/auth/calendar.readonly",
     "https://www.googleapis.com/auth/calendar.events",
 ]
-
-type TokenProvider = Callable[[], Awaitable[str]]
 
 
 class CalendarError(ToolError):
@@ -33,30 +30,11 @@ def oauth_token_provider(
     """Access tokens minted from a refresh token, renewed shortly before they expire.
 
     `refused` is the message the agent gets if Google rejects the refresh token."""
-    from google.auth.exceptions import RefreshError
-    from google.auth.transport.requests import Request
-    from google.oauth2.credentials import Credentials
+    from agent_mcp.google_signin import GoogleSignIn
 
-    creds = Credentials(
-        None,
-        refresh_token=refresh_token,
-        client_id=client_id,
-        client_secret=client_secret,
-        token_uri=TOKEN_URI,
-        scopes=SCOPES,
+    return GoogleSignIn("calendar", "Google Calendar", tuple(SCOPES), CalendarError).token_provider(
+        client_id, client_secret, refresh_token, refused
     )
-    lock = asyncio.Lock()
-
-    async def token() -> str:
-        async with lock:
-            if not creds.valid:
-                try:
-                    await asyncio.to_thread(creds.refresh, Request())
-                except RefreshError as e:
-                    raise CalendarError(refused) from e
-            return creds.token
-
-    return token
 
 
 class GoogleCalendar:
