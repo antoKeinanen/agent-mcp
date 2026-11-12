@@ -10,7 +10,9 @@ RUN uv sync --locked --no-dev --no-install-project
 COPY src ./src
 RUN uv sync --locked --no-dev
 
-RUN useradd --system --uid 10001 agent
+RUN useradd --system --uid 10001 agent && mkdir /data && chown agent /data
+# Saved Google sign-in lives here; a named volume inherits this ownership.
+VOLUME /data
 USER agent
 ENV PATH="/app/.venv/bin:$PATH" \
     AGENT_MCP__SERVER__TRANSPORT=streamable-http \

@@ -1,0 +1,124 @@
+"""Google sign-in that needs no terminal, browser callback or open port.
+
+1. Without a refresh token the server still starts and hands out a sign-in URL.
+2. After signing in, Google sends the browser to http://localhost/?code=... . That page
+   doesn't load, which is fine: its URL is copied into AGENT_MCP__CALENDAR__AUTH_CODE.
+3. On the next start the code is exchanged for a refresh token, saved to `token_file`, and
+   reused from then on. A code works once, so the saved token is what survives restarts.
+"""
+
+import hashlib
+import json
+import os
+from pathlib import Path
+from urllib.parse import parse_qs, urlencode, urlsplit
+
+import httpx
+
+from .google import AUTH_URI, SCOPES, TOKEN_URI, CalendarError
+
+REDIRECT_URI = "http://localhost"
+AUTH_CODE_VAR = "AGENT_MCP__CALENDAR__AUTH_CODE"
+
+
+def sign_in_url(client_id: str) -> str:
+    params = {
+        "client_id": client_id,
+        "redirect_uri": REDIRECT_URI,
+        "response_type": "code",
+        "scope": " ".join(SCOPES),
+        "access_type": "offline",
+        "prompt": "consent",
+    }
+    return f"{AUTH_URI}?{urlencode(params)}"
+
+
+def sign_in_help(client_id: str, reason: str = "Google Calendar is not signed in.") -> str:
+    return (
+        f"{reason} To sign in: (1) open {sign_in_url(client_id)} and allow access; "
+        "(2) the browser then goes to a localhost page that doesn't load, so copy that page's full URL; "
+        f'(3) put it in .env as {AUTH_CODE_VAR}="<the URL>" and restart (docker compose up -d) '
+        "within 10 minutes, before the code expires."
+    )
+
+
+def parse_code(value: str) -> str:
+    """The code from a pasted redirect URL, or the value itself if it's a bare code."""
+    value = value.strip().strip('"').strip("'")
+    if "code=" in value:
+        query = urlsplit(value).query or value.split("?", 1)[-1]
+        if codes := parse_qs(query).get("code"):
+            return codes[0]
+    return value
+
+
+def _fingerprint(code: str) -> str:
+    return hashlib.sha256(code.encode()).hexdigest()[:16]
+
+
+def load_token(path: Path, client_id: str) -> tuple[str | None, str | None]:
+    """(refresh token, fingerprint of the code it came from), if saved for this client."""
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None, None
+    if data.get("client_id") != client_id:
+        return None, None
+    return data.get("refresh_token"), data.get("code")
+
+
+def save_token(path: Path, client_id: str, refresh_token: str, code: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump({"client_id": client_id, "refresh_token": refresh_token, "code": _fingerprint(code)}, f)
+    tmp.replace(path)
+
+
+async def exchange_code(http: httpx.AsyncClient, client_id: str, client_secret: str, code: str) -> str:
+    r = await http.post(
+        TOKEN_URI,
+        data={
+            "code": code,
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "redirect_uri": REDIRECT_URI,
+            "grant_type": "authorization_code",
+        },
+    )
+    body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+    if r.is_error:
+        error = body.get("error", r.status_code)
+        if error == "invalid_grant":
+            raise CalendarError(sign_in_help(client_id, f"{AUTH_CODE_VAR} has expired or was already used."))
+        raise CalendarError(sign_in_help(client_id, f"Google rejected {AUTH_CODE_VAR} ({error})."))
+    if not body.get("refresh_token"):
+        raise CalendarError(sign_in_help(client_id, "Google returned no refresh token."))
+    return body["refresh_token"]
+
+
+async def refresh_token(
+    http: httpx.AsyncClient,
+    client_id: str,
+    client_secret: str,
+    configured: str | None,
+    token_file: Path | None,
+    auth_code: str | None,
+) -> str:
+    """Pick the refresh token: configured > saved (unless a new code was pasted) > exchanged code."""
+    if configured:
+        return configured
+    code = parse_code(auth_code) if auth_code else None
+    saved, saved_code = load_token(token_file, client_id) if token_file else (None, None)
+    if saved and (code is None or saved_code == _fingerprint(code)):
+        return saved
+    if code is None:
+        raise CalendarError(sign_in_help(client_id))
+    if token_file is None:
+        raise CalendarError(
+            f"{AUTH_CODE_VAR} needs AGENT_MCP__CALENDAR__TOKEN_FILE set, so the token outlives the one-use code."
+        )
+    token = await exchange_code(http, client_id, client_secret, code)
+    save_token(token_file, client_id, token, code)
+    return token

@@ -29,9 +29,17 @@ mcp_servers:
 `compose.yaml` runs the server in its own container over streamable HTTP. It publishes no ports. Other containers on the `agents` network reach it by Docker DNS at `http://agent-mcp:8765/mcp`, with no HTTP auth and no stdio.
 
 ```sh
-uv run agent-mcp-google-auth     # once, on the host: the browser sign-in writes the token into .env
 docker compose pull && docker compose up -d     # or: docker compose up -d --build
+docker compose logs agent-mcp                   # shows the Google sign-in link on first start
 ```
+
+Sign-in needs no shell in the container:
+
+1. Open the sign-in link from the log. Until you sign in, the calendar tools return the same link, so the agent can hand it to you.
+2. Allow access. The browser lands on a `http://localhost/?code=…` page that doesn't load. Copy its URL.
+3. Add it to `.env` as `AGENT_MCP__CALENDAR__AUTH_CODE="<that URL>"`, then run `docker compose up -d` within 10 minutes, before the code expires.
+
+The container exchanges the code once and saves the refresh token in the `agent-mcp-data` volume, so restarts and image updates keep you signed in. To switch accounts, paste a new code. If Google revokes access, the tools return a fresh link.
 
 `.github/workflows/container.yml` runs the tests, then builds the image for amd64 and arm64. On `main` it pushes `ghcr.io/antokeinanen/agent-mcp:latest` and `:sha-<commit>`. On a `v1.2.3` tag it also pushes `:1.2.3` and `:1.2`. Pull requests only build. The repository is private, so the package is too. Before pulling, run `docker login ghcr.io` with a personal access token that has the `read:packages` scope.
 
@@ -103,7 +111,8 @@ It uses a Google Calendar quirk. Events are created in a **hidden** "scheduling"
 | `calendar_calendars` | Lists every calendar, hidden ones included |
 | `calendar_events` | Lists events in a calendar between two dates (name or ID) |
 | `calendar_event` | Gets one event in full |
-| `calendar_organizations` | Shows the configured organizations: sources, ignore lists, instructions |
+| `calendar_organizations` | Shows the configured organizations: sources, feeds, ignore lists, instructions |
+| `calendar_scan` | Reads an organization's event feed and labels each upcoming event `missing`, `duplicate` or `ignored` |
 | `calendar_schedule` | The only write. See below |
 
 `calendar_schedule(organization, title, start, end?, description, location, source_url?, end_estimated, dry_run)`:
@@ -116,20 +125,28 @@ It uses a Google Calendar quirk. Events are created in a **hidden** "scheduling"
 
 The client has no update, delete or RSVP calls at all. The OAuth token does have write scope, though, so the module's code is what limits writes. If you want Google itself to enforce the limit, put the scheduling calendar on a separate Google account and sign in as that account.
 
-Fetching the organization's website isn't this module's job. Give the agent a fetch tool for that.
+### Event feeds
+
+An organization with a `feed` can be scanned. `calendar_scan(organization, days=60)` fetches the upcoming events and checks each one with the same rules `schedule` applies. Every event comes back with the `schedule` arguments ready to pass on: title, start, description, location and `source_url`. Scanning writes nothing.
+
+| Feed | Source | Notes |
+| --- | --- | --- |
+| `tko-aly` | `https://event-api.tko-aly.fi/api/events` | No end times, so `schedule` estimates them and adds `[#]`. Times are Helsinki local. Descriptions are HTML converted to text, with links, price, registration times and the event page appended. `source_url` is the event's page on members.tko-aly.fi |
+
+To add a feed, write an async function in `src/agent_mcp/modules/calendar/feeds.py` that returns `FeedEvent`s, and register it in `FEEDS`. For an organization without a feed, give the agent a fetch tool and let it read `sources`.
 
 ### Setup
 
 1. In Google Cloud, enable the Calendar API and create an OAuth client of type **Desktop app**. Put its ID and secret in `.env` as `AGENT_MCP__CALENDAR__CLIENT_ID` and `AGENT_MCP__CALENDAR__CLIENT_SECRET`.
 2. Create the scheduling calendar (e.g. "ai scheduling") and hide it in Google Calendar.
 3. Fill in the calendar block of `.env` (see `.env.example`). Each `AGENT_MCP__CALENDAR__ORGANIZATIONS__<KEY>__*` group is one organization.
-4. Run `uv run agent-mcp-google-auth`. It signs you in through the browser and writes `AGENT_MCP__CALENDAR__REFRESH_TOKEN` into `.env`.
+4. Sign in. In Docker, follow the steps under [Docker](#docker). On a machine with uv and a browser, `uv run agent-mcp-google-auth` signs you in and writes `AGENT_MCP__CALENDAR__REFRESH_TOKEN` into `.env`.
 
 ### Agent prompt
 
 With the rules in config, the prompt can be short:
 
-> For each organization from `calendar_organizations`, read its sources and list its upcoming events. Compare them with `calendar_events` on the organization's calendar. Call `calendar_schedule` for each event that's missing there, copying title, description, location and times as closely as you can, and pass `source_url`. Leave `end` out when the source doesn't clearly give one. Skip anything substantially the same as an `ignore` entry. Report what came back as created, duplicate or ignored.
+> For each organization from `calendar_organizations`, run `calendar_scan`. For each event marked `missing`, check that it isn't really the same as an existing or ignored event, then call `calendar_schedule` with its `schedule` arguments. Add an `end` only if the description clearly states one. Report what you scheduled and what you skipped.
 
 ## Writing a module
 
@@ -160,7 +177,7 @@ class Notes(Module[NotesSettings]):
         ...
 ```
 
-Parameters and return types become the tool's JSON schema. `read_only` and `destructive` are sent to the agent as MCP tool hints. They don't enforce anything. The allowlist is what restricts access.
+Parameters and return types become the tool's JSON schema. Raise `agent_mcp.module.ToolError` for failures the agent should read about, such as bad arguments or an upstream error. Any other exception reaches the agent only as "Error executing tool …", and its text stays in the server log. `read_only` and `destructive` are sent to the agent as MCP tool hints. They don't enforce anything. The allowlist is what restricts access.
 
 ## Test
 
