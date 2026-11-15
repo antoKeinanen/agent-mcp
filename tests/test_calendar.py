@@ -56,8 +56,18 @@ class FakeGoogle:
                 lo, hi = req.url.params["timeMin"], req.url.params["timeMax"]
                 items = [e for e in items if lo[:10] <= e["start"]["dateTime"][:10] < hi[:10]]
             return httpx.Response(200, json={"items": items})
-        if req.method == "GET" and len(parts) == 5:
-            return httpx.Response(200, json=next(e for e in self.events[cal] if e["id"] == parts[4]))
+        if len(parts) == 5:
+            ev = next((e for e in self.events[cal] if e["id"] == parts[4]), None)
+            if ev is None:
+                return httpx.Response(404, json={"error": "not found"})
+            if req.method == "GET":
+                return httpx.Response(200, json=ev)
+            if req.method == "PATCH":
+                ev.update(json.loads(req.content))
+                return httpx.Response(200, json=ev)
+            if req.method == "DELETE":
+                self.events[cal].remove(ev)
+                return httpx.Response(204)
         return httpx.Response(404, json={})
 
 
@@ -210,3 +220,100 @@ async def test_errors_reach_the_agent(google: FakeGoogle, args: dict, message: s
         r = await c.call_tool("calendar_schedule", {"organization": "tko-aly", "title": "T", **args})
     assert r.is_error and message in r.content[0].text
     assert google.writes == []
+
+
+def tagged(org: str = "tko-aly") -> dict[str, Any]:
+    return {"extendedProperties": {"private": {"agent_mcp_org": org}}}
+
+
+async def schedule(c: Client, **args: Any) -> str:
+    r = await call(c, "schedule", organization="tko-aly", **({"title": "Talk", "start": "2026-11-20T18:00"} | args))
+    assert r["status"] == "created"
+    return r["event"]["id"]
+
+
+async def test_update_changes_only_given_fields_and_keeps_attendees(google: FakeGoogle) -> None:
+    async with client(google) as c:
+        eid = await schedule(c, end="2026-11-20T20:00", location="Gurula")
+        r = await call(c, "update", organization="tko-aly", event_id=eid, title="Guest talk", start="2026-11-21T17:00")
+    assert r["status"] == "updated"
+    req = google.writes[-1]
+    assert req.method == "PATCH" and unquote(req.url.path).endswith(f"/calendars/{HOST}/events/{eid}")
+    assert req.url.params["sendUpdates"] == "none"
+    body = json.loads(req.content)
+    assert set(body) == {"summary", "start", "end"}  # no attendees, location or tags
+    assert body["start"]["dateTime"] == "2026-11-21T17:00:00+02:00"
+    assert body["end"]["dateTime"] == "2026-11-21T19:00:00+02:00"  # length kept
+    [ev] = google.events[HOST]
+    assert ev["attendees"] == [{"email": ORG, "responseStatus": "needsAction"}]
+
+
+async def test_real_end_clears_estimated_mark(google: FakeGoogle) -> None:
+    async with client(google) as c:
+        eid = await schedule(c, description="Fun")
+        assert google.events[HOST][0]["summary"] == "[#] Talk"
+        await call(c, "update", organization="tko-aly", event_id=eid, end="2026-11-20T21:00")
+    ev = google.events[HOST][0]
+    assert ev["summary"] == "Talk" and ev["description"] == "Fun"
+    assert ev["end"]["dateTime"] == "2026-11-20T21:00:00+02:00"
+
+
+async def test_end_estimated_marks_once(google: FakeGoogle) -> None:
+    async with client(google) as c:
+        eid = await schedule(c, end="2026-11-20T20:00")
+        await call(c, "update", organization="tko-aly", event_id=eid, end_estimated=True)
+        r = await call(c, "update", organization="tko-aly", event_id=eid, end_estimated=True)
+    assert r["status"] == "unchanged"
+    ev = google.events[HOST][0]
+    assert ev["summary"] == "[#] Talk" and ev["description"].count("estimated") == 1
+
+
+async def test_update_dry_run_and_no_op_write_nothing(google: FakeGoogle) -> None:
+    async with client(google) as c:
+        eid = await schedule(c, end="2026-11-20T20:00")
+        dry = await call(c, "update", organization="tko-aly", event_id=eid, title="New", dry_run=True)
+        same = await call(c, "update", organization="tko-aly", event_id=eid, title="Talk")
+    assert dry["status"] == "dry_run" and dry["changes"] == {"summary": "New"}
+    assert same["status"] == "unchanged"
+    assert len(google.writes) == 1
+
+
+async def test_delete_removes_own_event(google: FakeGoogle) -> None:
+    async with client(google) as c:
+        eid = await schedule(c)
+        dry = await call(c, "delete", organization="tko-aly", event_id=eid, dry_run=True)
+        assert dry["status"] == "dry_run" and len(google.writes) == 1
+        r = await call(c, "delete", organization="tko-aly", event_id=eid)
+    assert r["status"] == "deleted"
+    assert google.writes[-1].method == "DELETE" and google.events[HOST] == []
+
+
+@pytest.mark.parametrize(
+    ("cal", "extra", "message"),
+    [
+        (HOST, {}, "not created by `schedule`"),  # put there by hand
+        (HOST, tagged("other-org"), "not created by `schedule` for 'tko-aly'"),
+        (HOST, tagged() | {"organizer": {"email": OTHER}}, "organized by"),  # someone else's invite
+        (OTHER, tagged(), "no event"),  # the user's own calendar is never looked at
+        (ORG, tagged(), "no event"),
+    ],
+)
+@pytest.mark.parametrize("tool", ["update", "delete"])
+async def test_only_events_schedule_created_can_change(
+    google: FakeGoogle, cal: str, extra: dict, message: str, tool: str
+) -> None:
+    google.add(cal, "Dentist", "2026-11-20T10:00:00+02:00", "2026-11-20T11:00:00+02:00", **extra)
+    eid = google.events[cal][0]["id"]
+    async with client(google) as c:
+        r = await c.call_tool(f"calendar_{tool}", {"organization": "tko-aly", "event_id": eid, "title": "x"}
+                              if tool == "update" else {"organization": "tko-aly", "event_id": eid})
+    assert r.is_error and message in r.content[0].text
+    assert google.writes == []
+
+
+async def test_update_rejects_bad_times(google: FakeGoogle) -> None:
+    async with client(google) as c:
+        eid = await schedule(c, end="2026-11-20T20:00")
+        r = await c.call_tool("calendar_update", {"organization": "tko-aly", "event_id": eid, "end": "2026-11-20T17:00"})
+    assert r.is_error and "end must be after start" in r.content[0].text
+    assert len(google.writes) == 1

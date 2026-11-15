@@ -104,7 +104,7 @@ Startup fails, listing every problem, on an unknown module, an unknown tool name
 
 ## Calendar module
 
-Lets the agent read your whole Google Calendar and offer you events, without being able to change anything you already have.
+Lets the agent read your whole Google Calendar and offer you events, and change or delete the events it offered, without being able to change anything else you have.
 
 It uses a Google Calendar quirk. Events are created in a **hidden** "scheduling" calendar and invite a **visible** organization calendar as the only attendee. They show up in the visible calendar as pending invitations, and you RSVP to the ones you want to go to.
 
@@ -115,7 +115,9 @@ It uses a Google Calendar quirk. Events are created in a **hidden** "scheduling"
 | `calendar_event` | Gets one event in full |
 | `calendar_organizations` | Shows the configured organizations: sources, feeds, ignore lists, instructions |
 | `calendar_scan` | Reads an organization's event feed and labels each upcoming event `missing`, `duplicate` or `ignored` |
-| `calendar_schedule` | The only write. See below |
+| `calendar_schedule` | Creates an event. See below |
+| `calendar_update` | Changes an event `schedule` created. See below |
+| `calendar_delete` | Deletes an event `schedule` created, which also removes its invitation |
 | `calendar_sign_in` | Finishes Google sign-in from the URL your browser lands on. Only works while signed out |
 
 `calendar_schedule(organization, title, start, end?, description, location, source_url?, end_estimated, dry_run)`:
@@ -126,7 +128,13 @@ It uses a Google Calendar quirk. Events are created in a **hidden** "scheduling"
 - returns `duplicate` if the same `source_url` was scheduled before, or a similar title is already on either calendar that day
 - with no `end` (or `end_estimated = true`), adds `[#]` to the title, uses `default_duration_minutes`, and says in the description that the end time was estimated
 
-The client has no update, delete or RSVP calls at all. The OAuth token does have write scope, though, so the module's code is what limits writes. If you want Google itself to enforce the limit, put the scheduling calendar on a separate Google account and sign in as that account.
+`calendar_update(organization, event_id, title?, start?, end?, description?, location?, end_estimated?, dry_run)` and `calendar_delete(organization, event_id, dry_run)` work only on events `schedule` created:
+
+- the event must be on the organization's scheduling calendar, carry that organization's private tag, and not be organized by anyone else. Any other event, your own included, is refused
+- `update` sends only the fields that change and never touches the attendees, so the invitation and your RSVP stay as they are
+- moving `start` without `end` keeps the event's length. A real `end` removes the `[#]` prefix and the estimated-end note, and `end_estimated = true` adds them back
+
+To keep the agent from editing, leave `update` and `delete` out of `TOOLS`. The client has no RSVP call at all. The OAuth token does have write scope, though, so the module's code is what limits writes. If you want Google itself to enforce the limit, put the scheduling calendar on a separate Google account and sign in as that account.
 
 ### Event feeds
 

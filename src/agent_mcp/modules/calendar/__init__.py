@@ -4,11 +4,13 @@ The trick: events are created in a hidden "scheduling" calendar and invite a vis
 organization calendar as an attendee. They then show up in the visible calendar as
 pending invitations (RSVP needsAction), so you can pick which ones to go to.
 
-The agent can read every calendar. Its only write is `schedule`, which:
-  * creates an event in the organization's scheduling calendar, never anywhere else,
-  * invites exactly one attendee, the organization's calendar, as needsAction,
-  * refuses titles on the organization's ignore list,
-  * skips events already present in either calendar.
+The agent can read every calendar. Its writes are:
+  * `schedule`, which creates an event in the organization's scheduling calendar, never
+    anywhere else, invites exactly one attendee (the organization's calendar, as needsAction),
+    refuses titles on the ignore list and skips events already present in either calendar;
+  * `update` and `delete`, which only touch events `schedule` created: events on the
+    organization's scheduling calendar tagged with that organization. Every other event,
+    yours included, stays out of reach, and `update` never changes the attendees.
 """
 
 import logging
@@ -288,9 +290,7 @@ class Calendar(Module[CalendarSettings]):
             return {"status": "duplicate", **dup}
 
         if end_estimated:
-            if not title.startswith(org.estimated_end_prefix):
-                title = f"{org.estimated_end_prefix} {title}"
-            description = f"{description}\n\n{org.estimated_end_note}".strip()
+            title, description = _mark_estimated(org, title, description)
 
         private = {ORG_KEY: organization}
         if source_url:
@@ -312,6 +312,93 @@ class Calendar(Module[CalendarSettings]):
             return {"status": "dry_run", "calendar": host["id"], "event": body}
         created = await self._api.insert_event(host["id"], body, org.send_updates)
         return {"status": "created", "calendar": host["id"], "event": _summary(created)}
+
+    @tool
+    async def update(
+        self,
+        organization: str,
+        event_id: str,
+        title: str | None = None,
+        start: str | None = None,
+        end: str | None = None,
+        description: str | None = None,
+        location: str | None = None,
+        end_estimated: bool | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Change an event that `schedule` created for this organization. Only those events can be
+        changed: anything else, including the user's own events, is refused. Attendees and the
+        invitation's RSVP are left as they are.
+
+        Pass only what should change. `event_id` is the event's ID on the scheduling calendar (as
+        `schedule`, `scan` or `events` return it). Moving `start` without `end` keeps the event's
+        length. Giving a real `end` clears the estimated-end prefix and note; set `end_estimated`
+        to true to mark the end as estimated, or false to clear the mark without moving the end.
+
+        Returns status "updated", "unchanged" (nothing to change; nothing written) or "dry_run"
+        (the changes that would be sent).
+        """
+        org = self._org(organization)
+        host, ev = await self._owned(organization, org, event_id)
+
+        cur_start, cur_end = self._parse(_when_str(ev, "start")), self._parse(_when_str(ev, "end"))
+        start_v = self._parse(start) if start is not None else cur_start
+        all_day = isinstance(start_v, date) and not isinstance(start_v, datetime)
+        if end is not None:
+            end_v = self._parse(end)
+        elif start is None:
+            end_v = cur_end
+        elif type(start_v) is type(cur_start):
+            end_v = start_v + (cur_end - cur_start)
+        else:
+            end_v = start_v + (timedelta(days=1) if all_day else timedelta(minutes=org.default_duration_minutes))
+        if type(end_v) is not type(start_v):
+            raise CalendarError("start and end must both be dates or both be datetimes")
+        if end_v <= start_v:
+            raise CalendarError("end must be after start")
+
+        old_title, old_desc = ev.get("summary", ""), ev.get("description", "")
+        was_estimated = old_title.startswith(org.estimated_end_prefix)
+        estimated = end_estimated if end_estimated is not None else (False if end is not None else was_estimated)
+        new_title, new_desc = _unmark_estimated(
+            org, title if title is not None else old_title, description if description is not None else old_desc
+        )
+        if estimated:
+            new_title, new_desc = _mark_estimated(org, new_title, new_desc)
+
+        changes: dict[str, Any] = {}
+        if new_title != old_title:
+            changes["summary"] = new_title
+        if new_desc != old_desc:
+            changes["description"] = new_desc
+        if location is not None and location != ev.get("location", ""):
+            changes["location"] = location
+        if start_v != cur_start or type(start_v) is not type(cur_start):
+            changes["start"] = self._when(start_v)
+        if end_v != cur_end or type(end_v) is not type(cur_end):
+            changes["end"] = self._when(end_v)
+
+        if not changes:
+            return {"status": "unchanged", "calendar": host["id"], "event": _summary(ev)}
+        if dry_run:
+            return {"status": "dry_run", "calendar": host["id"], "event_id": event_id, "changes": changes}
+        updated = await self._api.patch_event(host["id"], event_id, changes, org.send_updates)
+        return {"status": "updated", "calendar": host["id"], "event": _summary(updated)}
+
+    @tool(destructive=True)
+    async def delete(self, organization: str, event_id: str, dry_run: bool = False) -> dict[str, Any]:
+        """Delete an event that `schedule` created for this organization. This also removes the
+        invitation from the organization's calendar. Only those events can be deleted: anything
+        else, including the user's own events, is refused.
+
+        Returns status "deleted", or "dry_run" with the event that would be deleted.
+        """
+        org = self._org(organization)
+        host, ev = await self._owned(organization, org, event_id)
+        if dry_run:
+            return {"status": "dry_run", "calendar": host["id"], "event": _summary(ev)}
+        await self._api.delete_event(host["id"], event_id, org.send_updates)
+        return {"status": "deleted", "calendar": host["id"], "event": _summary(ev)}
 
     @tool(read_only=True)
     async def scan(self, organization: str, days: int = 60) -> dict[str, Any]:
@@ -380,6 +467,28 @@ class Calendar(Module[CalendarSettings]):
         if host.get("accessRole") not in WRITABLE:
             raise CalendarError(f"no write access to scheduling calendar {host['id']!r}")
         return host, invitee
+
+    async def _owned(
+        self, key: str, org: Organization, event_id: str
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """The organization's scheduling calendar and one of its events that `schedule` created.
+
+        This check is what keeps `update` and `delete` away from every other event."""
+        host, _ = await self._calendars_for(org)
+        try:
+            ev = await self._api.event(host["id"], event_id)
+        except CalendarError as e:
+            raise CalendarError(
+                f"no event {event_id!r} on the scheduling calendar of {key!r}; only events created "
+                f"with `schedule` can be changed ({e})"
+            ) from e
+        if ev.get("extendedProperties", {}).get("private", {}).get(ORG_KEY) != key:
+            raise CalendarError(f"event {event_id!r} was not created by `schedule` for {key!r}; refusing to change it")
+        if (organizer := ev.get("organizer", {}).get("email")) not in (None, host["id"]):
+            raise CalendarError(f"event {event_id!r} is organized by {organizer!r}, not the scheduling calendar")
+        if ev.get("status") == "cancelled":
+            raise CalendarError(f"event {event_id!r} is already deleted")
+        return host, ev
 
     @property
     def _api(self) -> GoogleCalendar:
@@ -483,6 +592,27 @@ def _event_day(e: dict[str, Any], day: Any) -> date | None:
     if "dateTime" in s:
         return day(datetime.fromisoformat(s["dateTime"]))
     return date.fromisoformat(s["date"]) if "date" in s else None
+
+
+def _mark_estimated(org: Organization, title: str, description: str) -> tuple[str, str]:
+    if not title.startswith(org.estimated_end_prefix):
+        title = f"{org.estimated_end_prefix} {title}"
+    if org.estimated_end_note not in description:
+        description = f"{description}\n\n{org.estimated_end_note}".strip()
+    return title, description
+
+
+def _unmark_estimated(org: Organization, title: str, description: str) -> tuple[str, str]:
+    if title.startswith(org.estimated_end_prefix):
+        title = title.removeprefix(org.estimated_end_prefix).lstrip()
+    return title, description.replace(org.estimated_end_note, "").strip()
+
+
+def _when_str(e: dict[str, Any], key: str) -> str:
+    w = e.get(key, {})
+    if not (v := w.get("dateTime") or w.get("date")):
+        raise CalendarError(f"event {e.get('id')!r} has no {key} time")
+    return v
 
 
 def _ignored(org: Organization, title: str) -> str | None:
