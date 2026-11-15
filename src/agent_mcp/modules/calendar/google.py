@@ -1,7 +1,7 @@
 """Minimal async Google Calendar v3 client.
 
-It can read anything, but the only write it has is `insert_event`. The module decides
-where that may be called. There is deliberately no update, delete, patch or RSVP method.
+It can read anything. Its writes are `insert_event`, `patch_event` and `delete_event`; the
+module decides where they may be called. There is deliberately no RSVP method.
 """
 
 from typing import Any
@@ -50,7 +50,7 @@ class GoogleCalendar:
         r = await self._http.request(method, path, headers=headers, **kw)
         if r.is_error:
             raise CalendarError(f"{method} {path}: {r.status_code} {r.text[:500]}")
-        return r.json()
+        return r.json() if r.content else {}
 
     async def _paged(self, path: str, params: dict[str, Any], limit: int) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
@@ -92,6 +92,21 @@ class GoogleCalendar:
     async def insert_event(self, calendar_id: str, body: dict[str, Any], send_updates: str) -> dict[str, Any]:
         return await self._request(
             "POST", f"/calendars/{_q(calendar_id)}/events", params={"sendUpdates": send_updates}, json=body
+        )
+
+    async def patch_event(
+        self, calendar_id: str, event_id: str, body: dict[str, Any], send_updates: str
+    ) -> dict[str, Any]:
+        return await self._request(
+            "PATCH",
+            f"/calendars/{_q(calendar_id)}/events/{_q(event_id)}",
+            params={"sendUpdates": send_updates},
+            json=body,
+        )
+
+    async def delete_event(self, calendar_id: str, event_id: str, send_updates: str) -> None:
+        await self._request(
+            "DELETE", f"/calendars/{_q(calendar_id)}/events/{_q(event_id)}", params={"sendUpdates": send_updates}
         )
 
 
